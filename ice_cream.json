@@ -1,0 +1,50 @@
+{
+  "title": "IceCream", 
+  "fromDate": "201606010000", 
+  "toDate": "201608010000",
+  "dataFormat": "activity-streams", 
+  "publisher": "Twitter", 
+  "streamType": "track_v2", 
+  "rules": [
+    {
+      "tag": "IceCream", 
+      "value": "ice cream"
+    }, 
+    {
+      "tag": "Vanila", 
+      "value": "(ice cream) vanila"
+    }, 
+    {
+      "tag": "Chocolate", 
+      "value": "(ice cream) chocolate"
+    }, 
+    {
+      "tag": "Strawberry", 
+      "value": "(ice cream) strawberry"
+    }, 
+    {
+      "tag": "RockyRoad", 
+      "value": "(ice cream) (rocky road)"
+    }, 
+    {
+      "tag": "Coffee", 
+      "value": "(ice cream) coffee"
+    }, 
+    {
+      "tag": "ChocolateChip", 
+      "value": "(ice cream) chocolate chip"
+    }, 
+    {
+      "tag": "MintChocolateChip", 
+      "value": "(ice cream) mint chocolate chip"
+    }, 
+    {
+      "tag": "CookiesAndCream", 
+      "value": "(ice cream) ((cookies cream) OR cookies-n-cream)"
+    }, 
+    {
+      "tag": "Other", 
+      "value": "(ice cream) -( chocolate OR vanilla OR strawberry OR (rocky road) OR coffee OR (chocolate chip) OR (mint chocolate chip) OR ((cookies cream) OR cookies-n-cream))"
+    }
+  ]
+}
