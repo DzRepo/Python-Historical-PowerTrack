@@ -6,19 +6,21 @@ import json
 import ConfigFile
 import urlparse
 import gzip
+import multiprocessing
 
 valid_status = ['finished', 'delivered']
+job_processors = []
+download_job_info = {}
+queue = multiprocessing.JoinableQueue()
+download_file_counter = 0
 
 
 def handle_error(ex):
     if ex is not None and ex.message is not None:
-        print("")
         print('{"Error": "' + str(ex.message) + '"}')
     elif ex is not None:
-        print("")
         print('{"Error": "' + str(ex) + '"}')
     else:
-        print("")
         print('{"Error": "(unknown error)"}')
 
 
@@ -28,6 +30,17 @@ def arg_count_check(minimum):
         sys.exit(2)
 
 
+def global_queue_test():
+    global queue
+    qsize = -1
+    try:
+        qsize = queue.qsize()
+    except NotImplementedError as ex:
+        print("Error getting qsize - not implemented")
+
+    print("in Global Queue Test, queue length = " + str(qsize))
+    return
+
 def parameter_help():
     print(" ")
     print("Usage:")
@@ -36,15 +49,17 @@ def parameter_help():
     print("./HPT.py set-username USERNAME")
     print("./HPT.py set-password PASSWORD")
     print("./HPT.py set-download-location DIRECTORY")
+    print("./HPT.py set-thread-count THREADCOUNT")
     print("./HPT.py create-job FILENAME.JSON")
-    print("./HPT.py get-jobs [JOB_TYPE_FILTER(s) - " +
-          "(O)pened, (E)stimating, (Q)uoted, (A)ccepted, (R)ejected, r(U)nning, (C)ompleted, (D)elivered, (F)ailed]")
+    print("./HPT.py get-jobs")
+    # [JOB_TYPE_FILTER(s) - (O)pened, (E)stimating, (Q)uoted, (A)ccepted, (R)ejected, r(U)nning,
+    # (C)ompleted, (D)elivered, (F)ailed])
     print("./HPT.py get-job-status JOB-ID")
     print("./HPT.py accept-job JOB-ID")
     print("./HPT.py reject-job JOB-ID")
     print("./HPT.py get-job-results JOB-ID [no-files] (removes urlList from results)")
     print("./HPT.py download-job JOB-ID [start-file-number] (optional # to resume stalled jobs)")
-    print("./HPT.py download-from-results RESULTS.JSON [start-file-number] (optional # to resume stalled jobs)")
+    print("./HPT.py download-from-results RESULTS.JSON JOB-ID [start-file-number] (optional # to resume stalled jobs)")
     print("./HPT.py validate-job JOB-ID    (confirms all files downloaded correctly and generates summary files)")
 
 
@@ -67,7 +82,7 @@ def get_response(method, endpoint, data=None):
         elif method.lower() in ['post', 'put']:
             response = requests.request(method.upper(),
                                         base_url + endpoint,
-                                        headers = headers,
+                                        headers=headers,
                                         json=data,
                                         auth=(username, password))
 
@@ -94,18 +109,23 @@ def get_response(method, endpoint, data=None):
     return None
 
 
-def download_file(url, uuid, directory):
+def download_file(item):
+    global download_job_info
+    file_name = "{None}"
     try:
+        file_number = item["number"]
+        url = item["url"]
         scheme, netloc, path, query, fragment = urlparse.urlsplit(url)
-        file_name_start = path.find(uuid) + len(uuid) + 1
+        file_name_start = path.find(download_job_info["uuid"]) + len(download_job_info["uuid"]) + 1
         file_name = path[file_name_start:]
-        file_name = uuid + "_" + file_name.replace("/","_")
-        print ("Downloading: " + file_name, end="")
+        file_name = download_job_info["uuid"] + "_" + file_name.replace("/", "_")
+        print ("Starting download - file #: " + str(file_number) + " name:" + file_name)
         sys.stdout.flush()
         file_request = None
         max_retries = 10
         try_count = 0
         success = False
+
         # trap timeout errors and auto retry
         while try_count < max_retries and success is False:
             try:
@@ -113,46 +133,105 @@ def download_file(url, uuid, directory):
                 success = True
             except requests.RequestException:
                 try_count += 1
-                print(" - Timeout. Retrying.", end="")
+                print("Timeout downloading file : " + str(file_number) + " name:" + file_name + ".  Retrying.")
                 sys.stdout.flush()
             except Exception as exp:
-                print("Error in download_file: " + str(exp))
+                print("Error in download_file: " + file_name + " msg:" + str(exp))
         #  didn't work...
         if try_count >= max_retries and success is False:
-            raise Exception("Too many retries.  Failing.")
-            return False
+            raise Exception("Too many retries downloading " + file_name + " - Failing.")
 
-        output = open(directory + file_name, 'wb')
+        output = open(download_job_info["directory"] + file_name, 'wb')
         output.write(file_request.content)
         output.close()
-        print(" - done.")
+        print("Finished download - file #: " + str(file_number) + " name:" + file_name)
         return True
     except Exception as e:
-        handle_error(Exception("Error Downloading file " + str(e.message)))
+        handle_error(Exception("Error Downloading file " + file_name + " msg:" + str(e.message)))
         return False
 
 
-def download_files(url_list, uuid, start_file=0):
+def cleanup():
+    global job_processors
+    global queue
+
+    print("Cleaning up...")
+
+    queue.cancel_join_thread()
+
+    print("Shutting down processors")
+    for proc in job_processors:
+        try:
+            print("Stopping processor: " + proc.name, end="")
+            proc.terminate()
+            print(" - stopped.")
+        except Exception as e:
+            handle_error(e)
+
+    queue = None
+    return
+
+
+def worker(queue):
+
+    print("Starting Worker")
     try:
-        file_count = 0
+        for item in iter(queue.get, None):
+            try:
+                download_file(item)
+            except Exception as e:
+                handle_error(e)
+            finally:
+                queue.task_done()
+        print("Finished queue loop")
+        queue.task_done()
+    except Exception as e:
+        handle_error(e)
+
+    print("Worker finished")
+
+
+def download_files(url_list, uuid, start_file=0):
+
+    global job_processors
+    global download_job_info
+    global queue
+
+    try:
         hpt_preferences = ConfigFile.get_settings("gnip.cfg", "HPT")
-        download_status = True
-        print("Starting at file:" + str(start_file))
-        print("Downloading files to: " + hpt_preferences["destination"])
-        for url in url_list:
-            # abort if a file fails.
-            if download_status:
-                file_count += 1
-                # skip if file is less than start file #
-                if file_count >= int(start_file):
-                    print ("#" + str(file_count), end=": ")
-                    download_status = download_file(url, uuid, hpt_preferences["destination"])
-            else:
-                print("")
-                return False
-        print("")
-        print("Done!")
-        return True
+        download_job_info["uuid"] = uuid
+        download_job_info["start_file"] = start_file
+        download_job_info["directory"] = hpt_preferences["destination"]
+
+        thread_count = hpt_preferences["threadcount"]
+
+        file_count = 0
+        print("Queuing files.")
+        for item in url_list:
+            file_count += 1
+            queue.put({"url": item, "number": file_count})
+        print("Queueing complete.")
+
+        print("Starting worker threads")
+        try:
+            for i in range(int(thread_count)):
+                job_processors.append(multiprocessing.Process(target=worker, args=(queue,)))
+                job_processors[-1].daemon = True
+                job_processors[-1].name = str(i)
+                job_processors[-1].start()
+                print("Thread " + str(i) + " created.")
+        except Exception as ex:
+            print("Process interrupted: " + str(ex))
+            sys.exit()
+
+        try:
+            # wait for workers to finish processing queue
+            queue.join()
+            return True
+        except KeyboardInterrupt:
+            print("Ctrl-C pressed.  Terminating application.")
+            cleanup()
+            return False
 
     except Exception as e:
         print("")
@@ -160,7 +239,7 @@ def download_files(url_list, uuid, start_file=0):
         return False
 
 
-def download_from_results(file_name, start_file=0):
+def download_from_results(file_name, uuid, start_file=0):
     try:
         results = json.loads(open(file_name, "r").read())
         if results is not None:
@@ -168,7 +247,6 @@ def download_from_results(file_name, start_file=0):
             if results['urlCount'] == 0:
                 print("Nothing to do:.  " + results['urlCount'] + " files available to download.")
             else:
-                uuid = results["urlList"][0][150:160]
                 success = download_files(results['urlList'], uuid, start_file)
                 if success:
                     return {"results": "Successfully downloaded files"}
@@ -193,8 +271,11 @@ def download_job(uuid, start_file=0):
                 if results['urlCount'] == 0:
                     print("Nothing to do:.  " + results['urlCount'] + " files available to download.")
                 else:
-                    download_files(results['urlList'], uuid, start_file)
-                    return {"result": "Successfully downloaded job"}
+                    success = download_files(results['urlList'], uuid, start_file)
+                    if success:
+                        return {"results": "Successfully downloaded files"}
+                    else:
+                        return {"results": "Error downloading files"}
         else:
             print("Current job status: " + job_info["status"] + " - Complete: " + job_info["percentComplete"] + "%")
             return {"result": "Nothing to do"}
@@ -233,6 +314,15 @@ def set_password(password):
 def set_download_location(location):
     try:
         ConfigFile.set_property("gnip.cfg", "HPT", "destination", location)
+        return {"result": "success"}
+    except Exception as ex:
+        handle_error(ex)
+    return {"result": "failed"}
+
+
+def set_thread_count(thread_count):
+    try:
+        ConfigFile.set_property("gnip.cfg", "HPT", "threadcount", thread_count)
         return {"result": "success"}
     except Exception as ex:
         handle_error(ex)
@@ -286,12 +376,11 @@ def reject_job(uuid):
 
 
 def validate_file(url, uuid, directory):
-    file_name = "{None}"
     try:
         scheme, netloc, path, query, fragment = urlparse.urlsplit(url)
         file_name_start = path.find(uuid) + len(uuid) + 1
         file_name = path[file_name_start:]
-        file_name = uuid + "_" + file_name.replace("/","_")
+        file_name = uuid + "_" + file_name.replace("/", "_")
         # print ("Validating: " + file_name, end="")
         sys.stdout.flush()
 
@@ -401,6 +490,9 @@ if __name__ == "__main__":
     elif action.lower() == "set-download-location":
         arg_count_check(1)
         result = set_download_location(sys.argv[2])
+    elif action.lower() == "set-thread-count":
+        arg_count_check(1)
+        result = set_thread_count(sys.argv[2])
     elif action.lower() == "create-job":
         arg_count_check(1)
         result = create_job(sys.argv[2])
@@ -427,11 +519,11 @@ if __name__ == "__main__":
             start = sys.argv[3]
         result = download_job(sys.argv[2], start)
     elif action.lower() == "download-from-results":
-        arg_count_check(1)
+        arg_count_check(2)
         start = 0
-        if len(sys.argv) > 3:
-            start = int(sys.argv[3])
-        result = download_from_results(sys.argv[2], start)
+        if len(sys.argv) > 4:
+            start = int(sys.argv[4])
+        result = download_from_results(sys.argv[2], sys.argv[3], start)
     elif action.lower() == "validate-job":
         arg_count_check(1)
         result = validate_job(sys.argv[2])
